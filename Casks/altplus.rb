@@ -1,6 +1,6 @@
 cask "altplus" do
-  version "0.0.0"
-  sha256 :no_check
+  version "0.1.0"
+  sha256 "8dc0cb78273e6d7c6416eb64afef79408c52cae31598aa76d880c1a0ad7d0695"
 
   url "https://github.com/guillermoleale/altplus/releases/download/v#{version}/AltPlus-#{version}.zip"
   name "AltPlus"
