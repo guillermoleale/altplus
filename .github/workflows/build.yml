@@ -1,0 +1,93 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Firma con identidad estable si el repo tiene el certificado en secrets
+      # (se carga una vez con scripts/setup-release-signing.sh). Sin certificado, firma ad hoc:
+      # la app funciona igual, pero cada versión obliga a conceder los permisos de nuevo.
+      - name: Importar certificado de firma
+        env:
+          P12_BASE64: ${{ secrets.SIGNING_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
+          IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+        run: |
+          if [ -z "$P12_BASE64" ]; then
+            echo "::warning::Sin certificado en secrets: la release se firma ad hoc."
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p ci "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p ci "$KEYCHAIN"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S "apple-tool:,apple:,codesign:" -s -k ci "$KEYCHAIN" >/dev/null
+          rm -f "$RUNNER_TEMP/signing.p12"
+          # codesign busca la identidad en la lista de llaveros del usuario. Un certificado autofirmado
+          # no necesita estar marcado como confiable para firmar (probado con codesign de macOS 26).
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          echo "ALTPLUS_SIGN_IDENTITY=${IDENTITY:-AltPlus Release}" >> "$GITHUB_ENV"
+
+      - name: Compilar y empaquetar
+        env:
+          ALTPLUS_UNIVERSAL: "1"
+        run: |
+          scripts/build-app.sh
+          scripts/package.sh
+          codesign -dv --verbose=2 build/AltPlus.app 2>&1 | grep -E "Identifier|Authority|Signature" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AltPlus
+          path: build/dist
+
+      - name: Publicar release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/dist/*
+          generate_release_notes: true
+          body: |
+            **Instalar**
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
+            ```
+
+            O con Homebrew:
+
+            ```bash
+            brew tap ${{ github.repository_owner }}/altplus https://github.com/${{ github.repository }}
+            brew install --cask ${{ github.repository_owner }}/altplus/altplus
+            ```
+
+            O descarga el `.dmg` o el `.zip`. La app no está notarizada: la primera vez macOS la bloquea. Ve a Ajustes del Sistema › Privacidad y seguridad y pulsa "Abrir de todos modos".
+
+            Al abrirla, AltPlus pide el permiso de Accesibilidad. Atajos: `⌥⇥` ventanas de este escritorio, `⌥⌃⇥` ventanas de todos los escritorios.
+
+      - name: Actualizar el cask de Homebrew
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          SHA="$(grep "AltPlus-$VERSION.zip" build/dist/SHA256SUMS.txt | cut -d' ' -f1)"
+          git fetch origin main
+          git checkout -B main origin/main
+          scripts/update-cask.sh "$VERSION" "$SHA"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Cask: AltPlus $VERSION" || exit 0
+          git push origin main
